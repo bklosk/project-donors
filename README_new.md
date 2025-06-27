@@ -5,6 +5,7 @@ A comprehensive data collection system for analyzing donor-advised funds, privat
 ## 🎯 Project Overview
 
 This project provides tools to:
+
 - **Collect organizational data** on donor-advised funds and private foundations
 - **Generate research resources** for systematic grants data collection
 - **Consolidate and track** data over time with timestamps
@@ -64,11 +65,13 @@ jupyter notebook analyze_data.ipynb
 ## 📊 Data Sources
 
 ### Organizational Data (Automated)
+
 - **ProPublica Nonprofit Explorer API**: Free access to IRS 990 data
 - **Coverage**: 2M+ tax-exempt organizations
 - **Data includes**: EIN, name, location, classification, filing status
 
 ### Grants Data (Research Tools Provided)
+
 - **Candid Foundation Directory**: Most comprehensive (paid subscription)
 - **IRS 990 Schedule I**: Free but requires manual processing
 - **Foundation websites**: Direct from source but manual
@@ -77,33 +80,39 @@ jupyter notebook analyze_data.ipynb
 ## 📈 Generated Data Files
 
 ### Organizational Data
+
 - `donor_advised_funds.csv/xlsx`: Complete list with metadata
 - `private_foundations.csv/xlsx`: Complete list with metadata
 - Both include collection timestamps for tracking changes
 
 ### Grants Research Resources
+
 - `grants_research_plan.csv`: Prioritized list of foundations to research
 - `grants_collection_template.csv`: Template for recording found grants
 - Comprehensive research guide with URLs and search strategies
 
 ### Metadata
+
 - `collection_summary.json`: Run history, statistics, and timestamps
 
 ## 🔍 Key Features
 
 ### Smart Data Collection
+
 - **Rate limiting**: Respectful API usage with delays
 - **Deduplication**: Automatic removal of duplicate entries
 - **Error handling**: Robust retry logic and error recovery
 - **Progress tracking**: Real-time progress bars and logging
 
 ### Consolidated Files
+
 - **No timestamp pollution**: Single files updated each run
 - **Change tracking**: Collection timestamps for trend analysis
 - **Format flexibility**: Both CSV and Excel outputs
 - **Incremental updates**: Only new/changed data is processed
 
 ### Comprehensive Grants Research
+
 - **Prioritized targets**: Foundations ranked by research potential
 - **Research URLs**: Direct links to foundation profiles
 - **Search strategies**: Pre-built search queries for efficiency
@@ -112,18 +121,21 @@ jupyter notebook analyze_data.ipynb
 ## 🎯 Grants Data Collection Strategy
 
 ### 🥇 Immediate Approach (Free)
+
 1. Use generated research plan (`grants_research_plan.csv`)
 2. Visit foundation websites for published grants lists
 3. Search news sources for grant announcements
 4. Record findings in collection template
 
 ### 🥈 Thorough Approach (Some Cost)
+
 1. Download IRS 990 forms from ProPublica
 2. Extract Schedule I grants data (manual or automated)
 3. Focus on largest foundations first
 4. Build comprehensive database over time
 
 ### 🥉 Professional Approach (Paid)
+
 1. Subscribe to Candid Foundation Directory ($179+/month)
 2. Export grants data for target foundations
 3. Combine with organizational data from this project
@@ -132,6 +144,7 @@ jupyter notebook analyze_data.ipynb
 ## 📊 Sample Data Analysis
 
 The included Jupyter notebook demonstrates:
+
 - Geographic distribution of foundations
 - Analysis by foundation type and size
 - Grant-making patterns and trends
@@ -140,13 +153,16 @@ The included Jupyter notebook demonstrates:
 ## 🔧 Advanced Usage
 
 ### Custom Search Terms
+
 Modify search terms in `collect_data.py`:
+
 ```python
 donor_fund_terms = ['your', 'custom', 'terms']
 foundation_terms = ['your', 'foundation', 'terms']
 ```
 
 ### Data Export
+
 ```python
 import pandas as pd
 
@@ -161,7 +177,9 @@ ca_funds.to_csv('california_funds.csv', index=False)
 ```
 
 ### Research Automation
+
 Use the research plan for systematic data collection:
+
 ```python
 import pandas as pd
 
@@ -189,6 +207,7 @@ plan.to_csv('data/grants_research_plan.csv', index=False)
 ## 📝 Data Fields
 
 ### Donor-Advised Funds & Private Foundations
+
 - `ein`: Employer Identification Number
 - `name`: Organization name
 - `city`, `state`: Location
@@ -198,6 +217,7 @@ plan.to_csv('data/grants_research_plan.csv', index=False)
 - `collection_timestamp`: Human-readable timestamp
 
 ### Grants Data Template
+
 - `grantor_ein`, `grantor_name`: Foundation making the grant
 - `recipient_name`, `recipient_ein`: Organization receiving grant
 - `grant_amount`: Dollar amount
@@ -221,6 +241,7 @@ This project is for educational and research purposes. Please respect API rate l
 ## 🆘 Support
 
 For questions or issues:
+
 1. Check the comprehensive grants guide output
 2. Review the generated research resources
 3. Consult the data collection logs
@@ -229,6 +250,7 @@ For questions or issues:
 ## 🎓 Educational Use
 
 This project is ideal for:
+
 - **Nonprofit research**: Understanding the foundation ecosystem
 - **Academic studies**: Analyzing philanthropic patterns
 - **Grant seeking**: Identifying potential funders
