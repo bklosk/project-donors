@@ -6,12 +6,15 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 import glob
 from tqdm import tqdm
+import subprocess
 
 def download_file(url, folder):
     """Downloads a file from a URL and saves it to a folder."""
     os.makedirs(folder, exist_ok=True)
     filename = url.split('/')[-1]
     filepath = os.path.join(folder, filename)
+    if os.path.exists(filepath):
+        return filepath
     try:
         response = requests.get(url, stream=True)
         response.raise_for_status()
@@ -25,21 +28,19 @@ def download_file(url, folder):
 
 def extract_zip(filepath, extract_to='data/xmls'):
     """Extracts a zip file and removes it."""
-    if not filepath or not zipfile.is_zipfile(filepath):
+    if not filepath or not os.path.exists(filepath):
         return
     
     os.makedirs(extract_to, exist_ok=True)
 
     try:
         with zipfile.ZipFile(filepath, 'r') as zip_ref:
-            for member in zip_ref.infolist():
-                try:
-                    zip_ref.extract(member, extract_to)
-                except Exception as e:
-                    print(f"Could not extract {member.filename} from {os.path.basename(filepath)}. Error: {e}")
+            zip_ref.extractall(extract_to)
         os.remove(filepath)
     except zipfile.BadZipFile as e:
-        print(f"Error reading zip file {filepath}: {e}")
+        print(f"Error extracting {os.path.basename(filepath)}: Bad zip file - {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred during extraction of {os.path.basename(filepath)}: {e}")
 
 def download_and_extract_data():
     """
