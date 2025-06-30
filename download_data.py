@@ -3,28 +3,72 @@ import os
 import zipfile
 import pandas as pd
 import xml.etree.ElementTree as ET
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import glob
 from tqdm import tqdm
-import subprocess
+import logging
+import time
 
-def download_file(url, folder):
-    """Downloads a file from a URL and saves it to a folder."""
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def download_file(url, folder, retries=3, backoff_factor=0.5):
+    """Downloads a file from a URL and saves it to a folder with retries."""
     os.makedirs(folder, exist_ok=True)
     filename = url.split('/')[-1]
     filepath = os.path.join(folder, filename)
+
     if os.path.exists(filepath):
-        return filepath
-    try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        with open(filepath, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        return filepath
-    except requests.exceptions.RequestException as e:
-        print(f"Error downloading {url}: {e}")
-        return None
+        # If the file is a zip, validate it. If it's not valid, remove and redownload.
+        if filename.endswith('.zip'):
+            try:
+                with zipfile.ZipFile(filepath, 'r') as zf:
+                    if zf.testzip() is not None:
+                        logging.warning(f"Corrupt zip file detected: {filename}. Removing.")
+                        os.remove(filepath)
+                    else:
+                        logging.info(f"Existing valid zip file found: {filename}. Skipping download.")
+                        return filepath
+            except zipfile.BadZipFile:
+                logging.warning(f"Bad zip file detected: {filename}. Removing.")
+                os.remove(filepath)
+        else: # For non-zip files, assume existence means it's fine.
+            logging.info(f"File already exists: {filename}. Skipping download.")
+            return filepath
+
+    for attempt in range(retries):
+        try:
+            logging.info(f"Downloading {url} (Attempt {attempt + 1}/{retries})")
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+            with open(filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            # Verify zip file integrity after download
+            if filename.endswith('.zip'):
+                try:
+                    with zipfile.ZipFile(filepath, 'r') as zf:
+                        if zf.testzip() is not None:
+                            raise zipfile.BadZipFile("Corrupt zip file detected after download.")
+                    logging.info(f"Successfully downloaded and verified {filename}")
+                    return filepath
+                except zipfile.BadZipFile as e:
+                    logging.warning(f"Validation failed for {filename}: {e}. Deleting file.")
+                    os.remove(filepath)
+                    # Continue to next retry
+                    continue 
+            else:
+                logging.info(f"Successfully downloaded {filename}")
+                return filepath
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error downloading {url}: {e}")
+        
+        time.sleep(backoff_factor * (2 ** attempt))
+
+    logging.error(f"Failed to download {url} after {retries} attempts.")
+    return None
 
 def extract_zip(filepath, extract_to='data/xmls'):
     """Extracts a zip file and removes it."""
@@ -34,13 +78,38 @@ def extract_zip(filepath, extract_to='data/xmls'):
     os.makedirs(extract_to, exist_ok=True)
 
     try:
-        with zipfile.ZipFile(filepath, 'r') as zip_ref:
-            zip_ref.extractall(extract_to)
+        # Using system's unzip command for better compatibility
+        subprocess.run(
+            ['unzip', '-o', filepath, '-d', extract_to],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
         os.remove(filepath)
-    except zipfile.BadZipFile as e:
-        print(f"Error extracting {os.path.basename(filepath)}: Bad zip file - {e}")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logging.warning(f"'unzip' failed for {filepath}: {e}. Trying '7z'.")
+        try:
+            # Fallback to 7z for wider format support
+            subprocess.run(
+                ['7z', 'x', f'-o{extract_to}', filepath],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            os.remove(filepath)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e2:
+            logging.warning(f"'7z' also failed for {filepath}: {e2}. Falling back to zipfile.")
+            # Fallback to zipfile if unzip and 7z are not available or fail
+            try:
+                with zipfile.ZipFile(filepath, 'r') as zip_ref:
+                    zip_ref.extractall(extract_to)
+                os.remove(filepath)
+            except zipfile.BadZipFile as e_zip:
+                logging.error(f"Error extracting {os.path.basename(filepath)}: Bad zip file - {e_zip}")
+            except Exception as e_zip:
+                logging.error(f"An unexpected error occurred during extraction of {os.path.basename(filepath)} with zipfile: {e_zip}")
     except Exception as e:
-        print(f"An unexpected error occurred during extraction of {os.path.basename(filepath)}: {e}")
+        logging.error(f"An unexpected error occurred during extraction of {os.path.basename(filepath)}: {e}")
 
 def download_and_extract_data():
     """
@@ -153,23 +222,165 @@ def parse_grant_data(xml_file):
         print(f"An unexpected error occurred with {os.path.basename(xml_file)}: {e}")
         return []
 
+def parse_filer_data(xml_file):
+    """Parses an XML file to extract filer organization data."""
+    try:
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+        ns = {'irs': 'http://www.irs.gov/efile'}
+
+        # General Filer Information
+        filer_ein = root.find('.//irs:Filer/irs:EIN', ns)
+        filer_ein = filer_ein.text if filer_ein is not None else None
+        
+        filer_name_element = root.find('.//irs:Filer/irs:BusinessName/irs:BusinessNameLine1Txt', ns)
+        filer_name = filer_name_element.text if filer_name_element is not None else None
+        
+        # Address information
+        address_element = root.find('.//irs:Filer/irs:USAddress', ns)
+        if address_element is not None:
+            address_line1 = address_element.find('irs:AddressLine1Txt', ns)
+            address_line1 = address_line1.text if address_line1 is not None else None
+            
+            city = address_element.find('irs:CityNm', ns)
+            city = city.text if city is not None else None
+            
+            state = address_element.find('irs:StateAbbreviationCd', ns)
+            state = state.text if state is not None else None
+            
+            zip_code = address_element.find('irs:ZIPCd', ns)
+            zip_code = zip_code.text if zip_code is not None else None
+        else:
+            address_line1, city, state, zip_code = None, None, None, None
+
+        # Return-level data
+        return_type = root.find('.//irs:ReturnTypeCd', ns)
+        return_type = return_type.text if return_type is not None else None
+        
+        tax_period_begin = root.find('.//irs:TaxPeriodBeginDt', ns)
+        tax_period_begin = tax_period_begin.text if tax_period_begin is not None else None
+        
+        tax_period_end = root.find('.//irs:TaxPeriodEndDt', ns)
+        tax_period_end = tax_period_end.text if tax_period_end is not None else None
+        
+        tax_year = root.find('.//irs:TaxYr', ns)
+        tax_year = tax_year.text if tax_year is not None else None
+
+        # Business Officer Information
+        business_officer = root.find('.//irs:BusinessOfficerGrp/irs:PersonNm', ns)
+        business_officer = business_officer.text if business_officer is not None else None
+        
+        officer_title = root.find('.//irs:BusinessOfficerGrp/irs:PersonTitleTxt', ns)
+        officer_title = officer_title.text if officer_title is not None else None
+        
+        officer_phone = root.find('.//irs:BusinessOfficerGrp/irs:PhoneNum', ns)
+        officer_phone = officer_phone.text if officer_phone is not None else None
+
+        # Try to get organization type from various forms
+        org_501c_type = None
+        org_501_ind = None
+        
+        # Check IRS990 form
+        form_990 = root.find('.//irs:IRS990', ns)
+        if form_990 is not None:
+            org_501c_type_elem = form_990.find('.//irs:Organization501c3Ind', ns)
+            if org_501c_type_elem is not None:
+                org_501c_type = "501c3"
+            else:
+                org_501c_type_elem = form_990.find('.//irs:Organization501cInd', ns)
+                if org_501c_type_elem is not None:
+                    org_501c_type = "501c"
+
+        # Check IRS990PF form (Private Foundation)
+        form_990pf = root.find('.//irs:IRS990PF', ns)
+        if form_990pf is not None:
+            org_501c_type = "990PF"
+
+        # Check IRS990T form (Unrelated Business Income Tax)
+        form_990t = root.find('.//irs:IRS990T', ns)
+        if form_990t is not None:
+            org_501c_type_elem = form_990t.find('.//irs:Organization501cTypeTxt', ns)
+            if org_501c_type_elem is not None:
+                org_501c_type = f"501{org_501c_type_elem.text}"
+
+        # Financial information (if available)
+        total_revenue = None
+        total_expenses = None
+        net_assets = None
+        
+        if form_990 is not None:
+            total_revenue_elem = form_990.find('.//irs:TotalRevenueAmt', ns)
+            total_revenue = int(total_revenue_elem.text) if total_revenue_elem is not None else None
+            
+            total_expenses_elem = form_990.find('.//irs:TotalExpensesAmt', ns)
+            total_expenses = int(total_expenses_elem.text) if total_expenses_elem is not None else None
+            
+            net_assets_elem = form_990.find('.//irs:NetAssetsOrFundBalancesEOYAmt', ns)
+            net_assets = int(net_assets_elem.text) if net_assets_elem is not None else None
+
+        filer_data = {
+            'EIN': filer_ein,
+            'OrganizationName': filer_name,
+            'AddressLine1': address_line1,
+            'City': city,
+            'State': state,
+            'ZIPCode': zip_code,
+            'ReturnType': return_type,
+            'TaxPeriodBegin': tax_period_begin,
+            'TaxPeriodEnd': tax_period_end,
+            'TaxYear': tax_year,
+            'BusinessOfficer': business_officer,
+            'OfficerTitle': officer_title,
+            'OfficerPhone': officer_phone,
+            'Organization501cType': org_501c_type,
+            'TotalRevenue': total_revenue,
+            'TotalExpenses': total_expenses,
+            'NetAssets': net_assets
+        }
+        
+        return filer_data
+    except ET.ParseError as e:
+        print(f"Could not parse {os.path.basename(xml_file)}: {e}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred with {os.path.basename(xml_file)}: {e}")
+        return None
+
 def process_xml_files():
     """Processes all XML files in the data/xmls directory and saves the data to a CSV file."""
     all_grants = []
+    all_filer_data = []
     xml_files = glob.glob('data/xmls/*.xml')
 
     with ThreadPoolExecutor() as executor:
+        # Parse grant data
         results = executor.map(parse_grant_data, xml_files)
-        for result in tqdm(results, total=len(xml_files), desc="Parsing XML files"):
+        for result in tqdm(results, total=len(xml_files), desc="Parsing grant data"):
             all_grants.extend(result)
 
+        # Parse filer data
+        results = executor.map(parse_filer_data, xml_files)
+        for result in tqdm(results, total=len(xml_files), desc="Parsing filer data"):
+            if result is not None:
+                all_filer_data.append(result)
+
+    # Save grant data to CSV
     if all_grants:
         grants_df = pd.DataFrame(all_grants)
-        output_path = 'data/parsed_grants.csv'
-        grants_df.to_csv(output_path, index=False)
-        print(f"\nSuccessfully parsed {len(grants_df)} grants and saved to {output_path}")
+        grants_output_path = 'data/parsed_grants.csv'
+        grants_df.to_csv(grants_output_path, index=False)
+        print(f"\nSuccessfully parsed {len(grants_df)} grants and saved to {grants_output_path}")
     else:
         print("No grant data was parsed.")
+
+    # Save filer data to CSV
+    if all_filer_data:
+        filer_df = pd.DataFrame(all_filer_data)
+        filer_output_path = 'data/parsed_filer_data.csv'
+        filer_df.to_csv(filer_output_path, index=False)
+        print(f"Successfully parsed {len(filer_df)} filer records and saved to {filer_output_path}")
+    else:
+        print("No filer data was parsed.")
 
 if __name__ == "__main__":
     download_and_extract_data()
