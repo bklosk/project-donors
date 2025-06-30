@@ -8,108 +8,60 @@ from concurrent.futures import ThreadPoolExecutor
 import glob
 from tqdm import tqdm
 import logging
-import time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def download_file(url, folder, retries=3, backoff_factor=0.5):
-    """Downloads a file from a URL and saves it to a folder with retries."""
+def download_file(url, folder):
+    """Downloads a file from a URL and saves it to a folder."""
     os.makedirs(folder, exist_ok=True)
     filename = url.split('/')[-1]
     filepath = os.path.join(folder, filename)
 
     if os.path.exists(filepath):
-        # If the file is a zip, validate it. If it's not valid, remove and redownload.
-        if filename.endswith('.zip'):
-            try:
-                with zipfile.ZipFile(filepath, 'r') as zf:
-                    if zf.testzip() is not None:
-                        logging.warning(f"Corrupt zip file detected: {filename}. Removing.")
-                        os.remove(filepath)
-                    else:
-                        logging.info(f"Existing valid zip file found: {filename}. Skipping download.")
-                        return filepath
-            except zipfile.BadZipFile:
-                logging.warning(f"Bad zip file detected: {filename}. Removing.")
-                os.remove(filepath)
-        else: # For non-zip files, assume existence means it's fine.
-            logging.info(f"File already exists: {filename}. Skipping download.")
-            return filepath
+        logging.info(f"File already exists: {filename}. Skipping download.")
+        return filepath
 
-    for attempt in range(retries):
-        try:
-            logging.info(f"Downloading {url} (Attempt {attempt + 1}/{retries})")
-            response = requests.get(url, stream=True)
-            response.raise_for_status()
-            with open(filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            # Verify zip file integrity after download
-            if filename.endswith('.zip'):
-                try:
-                    with zipfile.ZipFile(filepath, 'r') as zf:
-                        if zf.testzip() is not None:
-                            raise zipfile.BadZipFile("Corrupt zip file detected after download.")
-                    logging.info(f"Successfully downloaded and verified {filename}")
-                    return filepath
-                except zipfile.BadZipFile as e:
-                    logging.warning(f"Validation failed for {filename}: {e}. Deleting file.")
-                    os.remove(filepath)
-                    # Continue to next retry
-                    continue 
-            else:
-                logging.info(f"Successfully downloaded {filename}")
-                return filepath
-
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Error downloading {url}: {e}")
-        
-        time.sleep(backoff_factor * (2 ** attempt))
-
-    logging.error(f"Failed to download {url} after {retries} attempts.")
-    return None
+    try:
+        logging.info(f"Downloading {url}")
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        with open(filepath, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        logging.info(f"Successfully downloaded {filename}")
+        return filepath
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error downloading {url}: {e}")
+        return None
 
 def extract_zip(filepath, extract_to='data/xmls'):
-    """Extracts a zip file and removes it."""
+    """Extracts a zip file using command-line tools and removes it."""
     if not filepath or not os.path.exists(filepath):
         return
-    
+
     os.makedirs(extract_to, exist_ok=True)
 
     try:
         # Using system's unzip command for better compatibility
         subprocess.run(
             ['unzip', '-o', filepath, '-d', extract_to],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         os.remove(filepath)
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        logging.warning(f"'unzip' failed for {filepath}: {e}. Trying '7z'.")
+        logging.info(f"Successfully extracted {os.path.basename(filepath)} with unzip.")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logging.warning(f"'unzip' failed for {os.path.basename(filepath)}. Trying '7z'.")
         try:
             # Fallback to 7z for wider format support
             subprocess.run(
-                ['7z', 'x', f'-o{extract_to}', filepath],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                ['7z', 'x', f'-o{extract_to}', filepath, '-y'],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             os.remove(filepath)
-        except (subprocess.CalledProcessError, FileNotFoundError) as e2:
-            logging.warning(f"'7z' also failed for {filepath}: {e2}. Falling back to zipfile.")
-            # Fallback to zipfile if unzip and 7z are not available or fail
-            try:
-                with zipfile.ZipFile(filepath, 'r') as zip_ref:
-                    zip_ref.extractall(extract_to)
-                os.remove(filepath)
-            except zipfile.BadZipFile as e_zip:
-                logging.error(f"Error extracting {os.path.basename(filepath)}: Bad zip file - {e_zip}")
-            except Exception as e_zip:
-                logging.error(f"An unexpected error occurred during extraction of {os.path.basename(filepath)} with zipfile: {e_zip}")
-    except Exception as e:
-        logging.error(f"An unexpected error occurred during extraction of {os.path.basename(filepath)}: {e}")
+            logging.info(f"Successfully extracted {os.path.basename(filepath)} with 7z.")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logging.error(f"Extraction failed for {os.path.basename(filepath)}. Both 'unzip' and '7z' failed.")
+
 
 def download_and_extract_data():
     """
