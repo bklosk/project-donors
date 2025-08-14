@@ -6,6 +6,7 @@ data/*
 
 # C extensions
 *.so
+ca-certificate.crt 
 
 # Distribution / packaging
 .Python

@@ -24,6 +24,8 @@ from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 from dotenv import load_dotenv
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+import socket
 
 try:
     import psycopg2
@@ -45,19 +47,179 @@ def _normalize_col(name: str) -> str:
     return s.strip("_")
 
 
+def _resolve_ipv4(host: str) -> Optional[str]:
+    try:
+        for fam, socktype, proto, canonname, sockaddr in socket.getaddrinfo(
+            host, None, socket.AF_INET
+        ):
+            ip, *_ = sockaddr
+            return str(ip)
+    except Exception:
+        return None
+
+
 def _connect():
+    """Establish a Postgres connection with a short connect timeout and
+    a quick host:port reachability probe to avoid long hangs.
+    """
     load_dotenv()  # load .env if present
+
+    # Allow override of timeout via env; default to 10s
+    try:
+        connect_timeout = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
+    except ValueError:
+        connect_timeout = 10
+
     url = os.getenv("DATABASE_URL")
     if url:
-        return psycopg2.connect(url)
+        # Ensure connect_timeout is present in the DSN/URL
+        try:
+            parsed = urlparse(url)
+            # Only attempt reachability probe if we have a hostname
+            host = parsed.hostname or "localhost"
+            port = parsed.port or 5432
+
+            # Fast TCP probe to fail fast if unreachable
+            try:
+                with socket.create_connection(
+                    (host, port), timeout=min(connect_timeout, 5)
+                ):
+                    pass
+            except OSError as e:
+                print(f"ERROR: Unable to reach PostgreSQL at {host}:{port} — {e}")
+                print(
+                    "Hint: check VPN/Firewall, host/port, and SSL settings (sslmode)."
+                )
+                raise SystemExit(1)
+
+            # Append connect_timeout to query if not already set
+            q = dict(parse_qsl(parsed.query))
+            if "connect_timeout" not in q:
+                q["connect_timeout"] = str(connect_timeout)
+            # Force sslmode=require unless explicitly provided
+            # If a CA is provided, prefer verify-full; else require
+            sslrootcert = os.getenv("DB_SSLROOTCERT")
+            if "sslmode" not in q:
+                q["sslmode"] = "verify-full" if sslrootcert else "require"
+            # Some networks/clients hang on GSS encryption negotiation; disable it
+            if "gssencmode" not in q:
+                q["gssencmode"] = "disable"
+            new_query = urlencode(q)
+            url = urlunparse(parsed._replace(query=new_query))
+        except Exception:
+            # If anything goes wrong with URL parsing, fall back to passing kwargs
+            pass
+
+        # Prefer using keyword args with hostaddr to bypass potential IPv6 issues
+        try:
+            parsed = urlparse(url)
+            kwargs = {
+                "dbname": (parsed.path or "/").lstrip("/") or None,
+                "user": parsed.username,
+                "password": parsed.password,
+                "host": parsed.hostname,
+                "port": parsed.port or 5432,
+                "connect_timeout": connect_timeout,
+            }
+            # Optional ssl root cert
+            sslrootcert = os.getenv("DB_SSLROOTCERT")
+            if sslrootcert and os.path.exists(sslrootcert):
+                kwargs["sslrootcert"] = sslrootcert
+                kwargs["sslmode"] = "verify-full"
+            # Keepalives to avoid silent stalls
+            kwargs.update(
+                {
+                    "keepalives": 1,
+                    "keepalives_idle": 5,
+                    "keepalives_interval": 5,
+                    "keepalives_count": 3,
+                }
+            )
+            # Disable GSS encryption negotiation explicitly if supported
+            kwargs["gssencmode"] = "disable"
+            # hostaddr to avoid IPv6 handshake stalls
+            ip = _resolve_ipv4(parsed.hostname) if parsed.hostname else None
+            if ip:
+                kwargs["hostaddr"] = ip
+            if os.getenv("DB_DEBUG"):
+                print(
+                    f"Connecting: host={kwargs.get('host')} hostaddr={kwargs.get('hostaddr')} port={kwargs.get('port')} db={kwargs.get('dbname')} sslrootcert={'yes' if 'sslrootcert' in kwargs else 'no'}",
+                    flush=True,
+                )
+            return psycopg2.connect(
+                **{k: v for k, v in kwargs.items() if v is not None}
+            )
+        except psycopg2.OperationalError as e:
+            print("ERROR: Failed to connect to PostgreSQL using DATABASE_URL.")
+            print(str(e))
+            print(
+                "Troubleshooting: verify credentials, host/port, and whether sslmode=require is needed."
+            )
+            raise SystemExit(1)
+
+    # Fall back to individual PG* env vars
     host = os.getenv("PGHOST", "localhost")
     port = int(os.getenv("PGPORT", "5432"))
     db = os.getenv("PGDATABASE") or os.getenv("POSTGRES_DB")
-    user = os.getenv("PGUSER") or os.getenv("POSTGRES_USER")
-    pwd = os.getenv("PGPASSWORD") or os.getenv("POSTGRES_PASSWORD")
+    # Support alternative env names seen in GUIs
+    user = os.getenv("PGUSER") or os.getenv("POSTGRES_USER") or os.getenv("PG_USERNAME")
+    pwd = (
+        os.getenv("PGPASSWORD")
+        or os.getenv("POSTGRES_PASSWORD")
+        or os.getenv("PG_PASSWORD")
+    )
     if not (db and user and pwd):
         raise SystemExit("Missing DB env vars. Set DATABASE_URL or PG* variables.")
-    return psycopg2.connect(host=host, port=port, dbname=db, user=user, password=pwd)
+
+    # Fast TCP probe to fail fast if unreachable
+    try:
+        with socket.create_connection((host, port), timeout=min(connect_timeout, 5)):
+            pass
+    except OSError as e:
+        print(f"ERROR: Unable to reach PostgreSQL at {host}:{port} — {e}")
+        print("Hint: ensure the database is running and accessible from this machine.")
+        raise SystemExit(1)
+
+    try:
+        kwargs = {
+            "host": host,
+            "port": port,
+            "dbname": db,
+            "user": user,
+            "password": pwd,
+            "connect_timeout": connect_timeout,
+        }
+        ip = _resolve_ipv4(host)
+        if ip:
+            kwargs["hostaddr"] = ip
+        sslrootcert = os.getenv("DB_SSLROOTCERT")
+        if sslrootcert and os.path.exists(sslrootcert):
+            kwargs["sslrootcert"] = sslrootcert
+            kwargs["sslmode"] = "verify-full"
+        else:
+            kwargs["sslmode"] = os.getenv("PGSSLMODE", "require")
+        # Keepalives to avoid silent stalls
+        kwargs.update(
+            {
+                "keepalives": 1,
+                "keepalives_idle": 5,
+                "keepalives_interval": 5,
+                "keepalives_count": 3,
+                "gssencmode": "disable",
+            }
+        )
+        if os.getenv("DB_DEBUG"):
+            print(
+                f"Connecting: host={kwargs.get('host')} hostaddr={kwargs.get('hostaddr')} port={kwargs.get('port')} db={kwargs.get('dbname')} sslrootcert={'yes' if 'sslrootcert' in kwargs else 'no'}",
+                flush=True,
+            )
+        return psycopg2.connect(**kwargs)
+    except psycopg2.OperationalError as e:
+        print(
+            "ERROR: Failed to connect to PostgreSQL with provided PG* environment variables."
+        )
+        print(str(e))
+        raise SystemExit(1)
 
 
 DDL_MAIN = r"""
@@ -225,14 +387,24 @@ CREATE TABLE IF NOT EXISTS stg_pf_payout (
 
 UPSERT_ORGS = r"""
 INSERT INTO organizations (ein, name, address_line1, city, state, zip_code, org_type, is_foundation)
-SELECT DISTINCT
-  s.ein, s.organizationname, s.addressline1, s.city, s.state, s.zipcode,
-  CASE WHEN s.organization501ctype='990PF' THEN 'PRIVATE_FOUNDATION'
-     WHEN s.organization501ctype IN ('501c3','501c') THEN 'PUBLIC_CHARITY'
-     ELSE 'OTHER' END,
-  (s.organization501ctype='990PF')
+SELECT DISTINCT ON (s.ein)
+    s.ein,
+    s.organizationname,
+    s.addressline1,
+    s.city,
+    s.state,
+    s.zipcode,
+    CASE
+        WHEN s.organization501ctype = '990PF' THEN 'PRIVATE_FOUNDATION'
+        WHEN s.organization501ctype IN ('501c3','501c') THEN 'PUBLIC_CHARITY'
+        ELSE 'OTHER'
+    END,
+    COALESCE( (s.organization501ctype = '990PF') OR (s.returntype = '990PF'), FALSE )
 FROM stg_filer s
 WHERE s.ein IS NOT NULL AND s.ein <> ''
+ORDER BY s.ein,
+    NULLIF(s.taxperiodend,'')::date DESC NULLS LAST,
+    NULLIF(s.taxyear,'')::int DESC NULLS LAST
 ON CONFLICT (ein) DO UPDATE
 SET name = EXCLUDED.name,
   city = COALESCE(EXCLUDED.city, organizations.city),
@@ -520,21 +692,46 @@ def transform_and_load(conn):
     cur.close()
 
 
+def _set_session_settings(conn):
+    """Apply optional per-session settings such as statement_timeout."""
+    with conn.cursor() as cur:
+        # statement timeout (milliseconds), 0 means no timeout
+        timeout_ms = os.getenv("DB_STATEMENT_TIMEOUT_MS")
+        if timeout_ms:
+            try:
+                int(timeout_ms)
+                cur.execute(f"SET statement_timeout = '{timeout_ms}ms';")
+            except Exception:
+                # Ignore invalid values
+                pass
+        # help identify session in DB dashboards
+        cur.execute("SET application_name = 'project-donors-upload';")
+    conn.commit()
+
+
 def main():
-    print("Connecting to PostgreSQL…")
+    print("Connecting to PostgreSQL…", flush=True)
     with _connect() as conn:
+        print("Connected.", flush=True)
+        _set_session_settings(conn)
+
+        print("Ensuring main schema (extensions, tables, indexes)…", flush=True)
         with conn.cursor() as cur:
             run_sql(cur, DDL_MAIN)
+        conn.commit()
+
+        print("Ensuring staging schema…", flush=True)
+        with conn.cursor() as cur:
             run_sql(cur, DDL_STAGING)
         conn.commit()
 
-        print("Loading CSVs into staging…")
+        print("Loading CSVs into staging…", flush=True)
         load_csvs(conn)
 
-        print("Upserting organizations, returns, payouts, and grants…")
+        print("Upserting organizations, returns, payouts, and grants…", flush=True)
         transform_and_load(conn)
 
-    print("Done.")
+    print("Done.", flush=True)
 
 
 if __name__ == "__main__":
