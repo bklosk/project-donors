@@ -52,6 +52,19 @@ python data_collector.py --skip-guide
 jupyter notebook analyze_data.ipynb
 ```
 
+### Upload CSVs to Postgres
+
+Environment variables (copy `.env.example` to `.env`):
+
+- DATABASE_URL=postgresql://user:pass@host:5432/dbname
+  or set PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
+
+Run the loader:
+
+```bash
+python upload_data.py
+```
+
 ## 📊 What You Get
 
 • **Organizational Data**:
@@ -80,6 +93,15 @@ jupyter notebook analyze_data.ipynb
 - `donor_advised_funds.csv/xlsx`: Complete list with metadata
 - `private_foundations.csv/xlsx`: Complete list with metadata
 - Both include collection timestamps for tracking changes
+
+### IRS 990 XML Parsed Outputs
+
+- `parsed_grants.csv`: Normalized Schedule I-style grants extracted from XML
+- `parsed_filer_data.csv`: Filer metadata (EIN, name, address, return info)
+- `parsed_pf_payout.csv`: Private foundation payout metrics from 990-PF including:
+  - DistributableAmount, QualifyingDistributions, UndistributedIncome
+  - PayoutShortfall and PayoutPressureIndex (shortfall/distributable)
+  - TaxPeriodEnd with FYEndYear and FYEndMonth for estimation windows
 
 ### Grants Research Resources
 

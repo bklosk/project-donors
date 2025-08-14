@@ -1,0 +1,541 @@
+"""
+ETL script to upload parsed CSVs into PostgreSQL.
+
+Load order:
+1) Load CSVs into staging tables (as-is, text columns).
+2) Upsert organizations from parsed_filer_data.csv (by EIN).
+3) Upsert returns from IRS index_YYYY.csv (join filer for dates, join orgs by EIN).
+4) Insert/Upsert pf_payouts by joining on (org EIN + period_end).
+5) Insert grants by joining on (filer_ein + period_end), set funder_org_id = returns.org_id.
+
+Env vars: DATABASE_URL or PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import re
+import sys
+import glob
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional
+
+import pandas as pd
+from dotenv import load_dotenv
+
+try:
+    import psycopg2
+    from psycopg2.extras import execute_batch
+except ImportError as e:
+    raise SystemExit(
+        "psycopg2-binary is required. Add it to requirements.txt and install."
+    )
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+
+
+def _normalize_col(name: str) -> str:
+    s = name.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    return s.strip("_")
+
+
+def _connect():
+    load_dotenv()  # load .env if present
+    url = os.getenv("DATABASE_URL")
+    if url:
+        return psycopg2.connect(url)
+    host = os.getenv("PGHOST", "localhost")
+    port = int(os.getenv("PGPORT", "5432"))
+    db = os.getenv("PGDATABASE") or os.getenv("POSTGRES_DB")
+    user = os.getenv("PGUSER") or os.getenv("POSTGRES_USER")
+    pwd = os.getenv("PGPASSWORD") or os.getenv("POSTGRES_PASSWORD")
+    if not (db and user and pwd):
+        raise SystemExit("Missing DB env vars. Set DATABASE_URL or PG* variables.")
+    return psycopg2.connect(host=host, port=port, dbname=db, user=user, password=pwd)
+
+
+DDL_MAIN = r"""
+-- Enable helpful extensions
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS btree_gin;
+
+-- 1) Organizations (foundations & public charities)
+CREATE TABLE IF NOT EXISTS organizations (
+  org_id          BIGSERIAL PRIMARY KEY,
+  ein             TEXT UNIQUE,                 -- 9-digit string, keep as text
+  name            TEXT NOT NULL,
+  aka             TEXT,
+  ntee_major      TEXT,                        -- fill later (BMF/NCCS)
+  ntee_refined    TEXT,
+  org_type        TEXT CHECK (org_type IN ('PUBLIC_CHARITY','PRIVATE_FOUNDATION','OTHER')),
+  is_foundation   BOOLEAN NOT NULL DEFAULT FALSE,
+  address_line1   TEXT,
+  city            TEXT,
+  state           CHAR(2),
+  zip_code        TEXT,
+  country         TEXT DEFAULT 'US',
+  created_at      TIMESTAMPTZ DEFAULT now(),
+  updated_at      TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS organizations_name_trgm ON organizations USING gin (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS organizations_state_idx ON organizations (state);
+
+-- 2) Returns (1 row per XML filing in the IRS index)
+CREATE TABLE IF NOT EXISTS returns (
+  return_id       BIGSERIAL PRIMARY KEY,
+  org_id          BIGINT REFERENCES organizations(org_id) ON DELETE CASCADE,
+  tax_year        INT,
+  period_begin    DATE,
+  period_end      DATE,
+  form_type       TEXT CHECK (form_type IN ('F990','F990PF','F990T','OTHER')),
+  index_year      INT,                        -- from index_2024.csv, etc.
+  object_id       TEXT,                       -- if present in index csv
+  source_url      TEXT NOT NULL,              -- XML URL from index
+  downloaded_at   TIMESTAMPTZ,                -- when you fetched it
+  UNIQUE (org_id, period_end, form_type, source_url)
+);
+CREATE INDEX IF NOT EXISTS returns_form_type_idx ON returns (form_type);
+CREATE INDEX IF NOT EXISTS returns_org_year_idx ON returns (org_id, tax_year);
+CREATE INDEX IF NOT EXISTS returns_period_end_idx ON returns (period_end);
+
+-- 3) Grants (denormalized rows from 990-PF grant tables)
+CREATE TABLE IF NOT EXISTS grants (
+  grant_id             BIGSERIAL PRIMARY KEY,
+  return_id            BIGINT REFERENCES returns(return_id) ON DELETE CASCADE,
+  funder_org_id        BIGINT REFERENCES organizations(org_id) ON DELETE SET NULL, -- same as returns.org_id
+  recipient_org_id     BIGINT REFERENCES organizations(org_id) ON DELETE SET NULL, -- null until you match
+  recipient_name_raw   TEXT NOT NULL,         -- exact text from filing
+  recipient_name_line1 TEXT,
+  recipient_name_line2 TEXT,
+  recipient_city       TEXT,
+  recipient_state      CHAR(2),
+  recipient_zip        TEXT,
+  recipient_country    TEXT,
+  recipient_province   TEXT,
+  recipient_postal     TEXT,
+  amount_cash          INT,
+  amount_noncash       INT,
+  amount_total         INT,
+  purpose_text         TEXT,
+  created_at           TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS grants_funder_idx ON grants (funder_org_id);
+CREATE INDEX IF NOT EXISTS grants_recipient_idx ON grants (recipient_org_id);
+CREATE INDEX IF NOT EXISTS grants_recipient_state_idx ON grants (recipient_state);
+CREATE INDEX IF NOT EXISTS grants_recipient_name_trgm ON grants USING gin (recipient_name_raw gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS grants_purpose_fts ON grants USING gin (to_tsvector('english', coalesce(purpose_text,'')));
+
+-- 4) Private-foundation payout metrics (one row per 990-PF return)
+CREATE TABLE IF NOT EXISTS pf_payouts (
+  return_id              BIGINT PRIMARY KEY REFERENCES returns(return_id) ON DELETE CASCADE,
+  distributable_amount   INT,
+  qualifying_distributions INT,
+  undistributed_income   INT,
+  payout_shortfall       INT,
+  payout_pressure_index  NUMERIC,     -- 0..1
+  fy_end_year            INT,
+  fy_end_month           INT,
+  computed_at            TIMESTAMPTZ DEFAULT now()
+);
+
+-- 5) Provenance for auditability (optional)
+CREATE TABLE IF NOT EXISTS facts_provenance (
+  prov_id         BIGSERIAL PRIMARY KEY,
+  entity_table    TEXT NOT NULL,      -- 'grants','returns','pf_payouts'
+  entity_pk       BIGINT NOT NULL,    -- id from that table
+  field_name      TEXT NOT NULL,      -- e.g., 'amount_total'
+  source_url      TEXT NOT NULL,
+  xpath_hint      TEXT,               -- optional
+  quote_snippet   TEXT,               -- optional
+  ingested_at     TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS facts_provenance_entity_idx ON facts_provenance (entity_table, entity_pk);
+"""
+
+
+DDL_STAGING = r"""
+-- Staging tables with raw text columns (load CSVs as-is)
+CREATE TABLE IF NOT EXISTS stg_filer (
+  ein TEXT,
+  organizationname TEXT,
+  addressline1 TEXT,
+  city TEXT,
+  state TEXT,
+  zipcode TEXT,
+  returntype TEXT,
+  taxperiodbegin TEXT,
+  taxperiodend TEXT,
+  taxyear TEXT,
+  businessofficer TEXT,
+  officertitle TEXT,
+  officerphone TEXT,
+  organization501ctype TEXT,
+  totalrevenue TEXT,
+  totalexpenses TEXT,
+  netassets TEXT
+);
+
+CREATE TABLE IF NOT EXISTS stg_index (
+  ein TEXT,
+  taxperiodend TEXT,
+  index_year TEXT,
+  object_id TEXT,
+  url TEXT,
+  formtype TEXT
+);
+
+CREATE TABLE IF NOT EXISTS stg_grants (
+  filerein TEXT,
+  taxperiodend TEXT,
+  recipientname TEXT,
+  recipientnameline1 TEXT,
+  recipientnameline2 TEXT,
+  recipientcity TEXT,
+  recipientstate TEXT,
+  recipientzip TEXT,
+  recipientcountry TEXT,
+  recipientprovince TEXT,
+  recipientpostal TEXT,
+  grantamountcash TEXT,
+  grantamountnoncash TEXT,
+  grantamounttotal TEXT,
+  grantpurpose TEXT
+);
+
+CREATE TABLE IF NOT EXISTS stg_pf_payout (
+  ein TEXT,
+  filername TEXT,
+  taxperiodend TEXT,
+  fyendyear TEXT,
+  fyendmonth TEXT,
+  distributableamount TEXT,
+  qualifyingdistributions TEXT,
+  undistributedincome TEXT,
+  payoutshortfall TEXT,
+  payoutpressureindex TEXT
+);
+"""
+
+
+UPSERT_ORGS = r"""
+INSERT INTO organizations (ein, name, address_line1, city, state, zip_code, org_type, is_foundation)
+SELECT DISTINCT
+  s.ein, s.organizationname, s.addressline1, s.city, s.state, s.zipcode,
+  CASE WHEN s.organization501ctype='990PF' THEN 'PRIVATE_FOUNDATION'
+     WHEN s.organization501ctype IN ('501c3','501c') THEN 'PUBLIC_CHARITY'
+     ELSE 'OTHER' END,
+  (s.organization501ctype='990PF')
+FROM stg_filer s
+WHERE s.ein IS NOT NULL AND s.ein <> ''
+ON CONFLICT (ein) DO UPDATE
+SET name = EXCLUDED.name,
+  city = COALESCE(EXCLUDED.city, organizations.city),
+  state= COALESCE(EXCLUDED.state, organizations.state);
+"""
+
+INSERT_RETURNS = r"""
+INSERT INTO returns (org_id, tax_year, period_begin, period_end, form_type, index_year, object_id, source_url, downloaded_at)
+SELECT o.org_id,
+     NULLIF(f.taxyear,'')::int,
+     NULLIF(f.taxperiodbegin,'')::date,
+     NULLIF(f.taxperiodend,'')::date,
+     CASE WHEN i.formtype='990PF' THEN 'F990PF'
+      WHEN i.formtype='990'   THEN 'F990'
+      WHEN i.formtype='990T'  THEN 'F990T'
+      ELSE 'OTHER' END,
+     NULLIF(i.index_year,'')::int,
+     i.object_id,
+     i.url,
+     now()
+FROM stg_index i
+JOIN stg_filer f  ON f.ein = i.ein AND f.taxperiodend = i.taxperiodend
+JOIN organizations o ON o.ein = i.ein
+ON CONFLICT (org_id, period_end, form_type, source_url) DO NOTHING;
+"""
+
+UPSERT_PF_PAYOUTS = r"""
+INSERT INTO pf_payouts (return_id, distributable_amount, qualifying_distributions, undistributed_income,
+            payout_shortfall, payout_pressure_index, fy_end_year, fy_end_month)
+SELECT r.return_id,
+  NULLIF(p.distributableamount,'')::numeric::int,
+  NULLIF(p.qualifyingdistributions,'')::numeric::int,
+  NULLIF(p.undistributedincome,'')::numeric::int,
+  NULLIF(p.payoutshortfall,'')::numeric::int,
+     NULLIF(p.payoutpressureindex,'')::numeric,
+     NULLIF(p.fyendyear,'')::int,
+     NULLIF(p.fyendmonth,'')::int
+FROM stg_pf_payout p
+JOIN organizations o ON o.ein = p.ein
+JOIN returns r ON r.org_id = o.org_id AND r.period_end = NULLIF(p.taxperiodend,'')::date
+ON CONFLICT (return_id) DO UPDATE
+SET distributable_amount = EXCLUDED.distributable_amount,
+  qualifying_distributions = EXCLUDED.qualifying_distributions;
+"""
+
+UPSERT_PF_PAYOUTS_FALLBACK = r"""
+-- Fallback: when no exact period_end match, attach to nearest tax_year for same org
+INSERT INTO pf_payouts (return_id, distributable_amount, qualifying_distributions, undistributed_income,
+                        payout_shortfall, payout_pressure_index, fy_end_year, fy_end_month)
+SELECT r.return_id,
+       NULLIF(p.distributableamount,'')::numeric::int,
+       NULLIF(p.qualifyingdistributions,'')::numeric::int,
+       NULLIF(p.undistributedincome,'')::numeric::int,
+       NULLIF(p.payoutshortfall,'')::numeric::int,
+       NULLIF(p.payoutpressureindex,'')::numeric,
+       NULLIF(p.fyendyear,'')::int,
+       NULLIF(p.fyendmonth,'')::int
+FROM stg_pf_payout p
+JOIN organizations o ON o.ein = p.ein
+LEFT JOIN returns r_exact ON r_exact.org_id = o.org_id AND r_exact.period_end = NULLIF(p.taxperiodend,'')::date
+JOIN LATERAL (
+  SELECT r2.return_id, r2.tax_year, r2.period_end
+  FROM returns r2
+  WHERE r2.org_id = o.org_id
+  ORDER BY ABS(r2.tax_year - NULLIF(p.fyendyear,'')::int) ASC, r2.period_end DESC NULLS LAST
+  LIMIT 1
+) r ON TRUE
+WHERE r_exact.return_id IS NULL
+ON CONFLICT (return_id) DO UPDATE
+SET distributable_amount = COALESCE(EXCLUDED.distributable_amount, pf_payouts.distributable_amount),
+    qualifying_distributions = COALESCE(EXCLUDED.qualifying_distributions, pf_payouts.qualifying_distributions),
+    undistributed_income = COALESCE(EXCLUDED.undistributed_income, pf_payouts.undistributed_income),
+    payout_shortfall = COALESCE(EXCLUDED.payout_shortfall, pf_payouts.payout_shortfall),
+    payout_pressure_index = COALESCE(EXCLUDED.payout_pressure_index, pf_payouts.payout_pressure_index),
+    fy_end_year = COALESCE(EXCLUDED.fy_end_year, pf_payouts.fy_end_year),
+    fy_end_month = COALESCE(EXCLUDED.fy_end_month, pf_payouts.fy_end_month);
+"""
+
+INSERT_GRANTS = r"""
+INSERT INTO grants (return_id, funder_org_id, recipient_name_raw, recipient_name_line1, recipient_name_line2,
+          recipient_city, recipient_state, recipient_zip, recipient_country, recipient_province,
+          recipient_postal, amount_cash, amount_noncash, amount_total, purpose_text)
+SELECT r.return_id, r.org_id,
+     g.recipientname, g.recipientnameline1, g.recipientnameline2,
+     g.recipientcity, g.recipientstate, g.recipientzip, g.recipientcountry, g.recipientprovince,
+     g.recipientpostal,
+  NULLIF(g.grantamountcash,'')::numeric::int,
+  NULLIF(g.grantamountnoncash,'')::numeric::int,
+  NULLIF(g.grantamounttotal,'')::numeric::int,
+     g.grantpurpose
+FROM stg_grants g
+JOIN organizations o ON o.ein = g.filerein
+JOIN returns r ON r.org_id = o.org_id AND r.period_end = NULLIF(g.taxperiodend,'')::date;
+"""
+
+
+def run_sql(cur, sql: str):
+    for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
+        cur.execute(stmt + ";")
+
+
+def truncate_staging(cur):
+    cur.execute("TRUNCATE stg_filer;")
+    cur.execute("TRUNCATE stg_index;")
+    cur.execute("TRUNCATE stg_grants;")
+    cur.execute("TRUNCATE stg_pf_payout;")
+
+
+def df_to_table(cur, df: pd.DataFrame, table: str, columns: List[str]):
+    # Keep only expected columns in order; add missing as empty string
+    df2 = df.copy()
+    for c in columns:
+        if c not in df2.columns:
+            df2[c] = None
+    df2 = df2[columns]
+    # Write to CSV buffer and COPY for speed
+    buf = io.StringIO()
+    df2.to_csv(buf, index=False, header=True)
+    buf.seek(0)
+    cur.copy_expert(
+        f"COPY {table} ({', '.join(columns)}) FROM STDIN WITH CSV HEADER", buf
+    )
+
+
+def load_csvs(conn):
+    cur = conn.cursor()
+    # Ensure schemas exist
+    run_sql(cur, DDL_MAIN)
+    run_sql(cur, DDL_STAGING)
+    conn.commit()
+
+    truncate_staging(cur)
+    conn.commit()
+
+    # 1) stg_filer
+    filer_path = DATA_DIR / "parsed_filer_data.csv"
+    if filer_path.exists():
+        df = pd.read_csv(filer_path, dtype=str, low_memory=False)
+        df.columns = [_normalize_col(c) for c in df.columns]
+        df_to_table(
+            cur,
+            df,
+            "stg_filer",
+            [
+                "ein",
+                "organizationname",
+                "addressline1",
+                "city",
+                "state",
+                "zipcode",
+                "returntype",
+                "taxperiodbegin",
+                "taxperiodend",
+                "taxyear",
+                "businessofficer",
+                "officertitle",
+                "officerphone",
+                "organization501ctype",
+                "totalrevenue",
+                "totalexpenses",
+                "netassets",
+            ],
+        )
+        conn.commit()
+    else:
+        print(f"WARNING: Missing {filer_path}")
+
+    # 2) stg_index (multiple files)
+    index_files = sorted(glob.glob(str(DATA_DIR / "index_202*.csv")))
+    if index_files:
+        # Create a temp buffer to accumulate rows across years
+        frames = []
+        for p in index_files:
+            df = pd.read_csv(p, dtype=str, low_memory=False)
+            df.columns = [_normalize_col(c) for c in df.columns]
+            # Normalize common column names
+            rename_map = {}
+            if "tax_period_end" in df.columns and "taxperiodend" not in df.columns:
+                rename_map["tax_period_end"] = "taxperiodend"
+            if "return_type" in df.columns and "formtype" not in df.columns:
+                rename_map["return_type"] = "formtype"
+            if "return_id" in df.columns and "object_id" not in df.columns:
+                rename_map["return_id"] = "object_id"
+            if rename_map:
+                df = df.rename(columns=rename_map)
+            # Add index_year if missing
+            if "index_year" not in df.columns:
+                m = re.search(r"index_(\d{4})\.csv$", p)
+                df["index_year"] = m.group(1) if m else None
+            frames.append(df[[c for c in df.columns]])
+
+        if frames:
+            df_all = pd.concat(frames, ignore_index=True)
+            df_to_table(
+                cur,
+                df_all,
+                "stg_index",
+                ["ein", "taxperiodend", "index_year", "object_id", "url", "formtype"],
+            )
+            conn.commit()
+    else:
+        print("WARNING: No index_202*.csv files found under data/")
+
+    # 3) stg_pf_payout
+    pf_path = DATA_DIR / "parsed_pf_payout.csv"
+    if pf_path.exists():
+        df = pd.read_csv(pf_path, dtype=str, low_memory=False)
+        df.columns = [_normalize_col(c) for c in df.columns]
+        df_to_table(
+            cur,
+            df,
+            "stg_pf_payout",
+            [
+                "ein",
+                "filername",
+                "taxperiodend",
+                "fyendyear",
+                "fyendmonth",
+                "distributableamount",
+                "qualifyingdistributions",
+                "undistributedincome",
+                "payoutshortfall",
+                "payoutpressureindex",
+            ],
+        )
+        conn.commit()
+    else:
+        print(f"WARNING: Missing {pf_path}")
+
+    # 4) stg_grants
+    grants_path = DATA_DIR / "parsed_grants.csv"
+    if grants_path.exists():
+        df = pd.read_csv(grants_path, dtype=str, low_memory=False)
+        df.columns = [_normalize_col(c) for c in df.columns]
+        # Normalize EIN and date columns to expected names
+        if "filer_ein" in df.columns and "filerein" not in df.columns:
+            df = df.rename(columns={"filer_ein": "filerein"})
+        if "tax_period_end" in df.columns and "taxperiodend" not in df.columns:
+            df = df.rename(columns={"tax_period_end": "taxperiodend"})
+        df_to_table(
+            cur,
+            df,
+            "stg_grants",
+            [
+                "filerein",
+                "taxperiodend",
+                "recipientname",
+                "recipientnameline1",
+                "recipientnameline2",
+                "recipientcity",
+                "recipientstate",
+                "recipientzip",
+                "recipientcountry",
+                "recipientprovince",
+                "recipientpostal",
+                "grantamountcash",
+                "grantamountnoncash",
+                "grantamounttotal",
+                "grantpurpose",
+            ],
+        )
+        conn.commit()
+    else:
+        print(f"WARNING: Missing {grants_path}")
+
+    # Done staging
+    cur.close()
+
+
+def transform_and_load(conn):
+    cur = conn.cursor()
+    # 1) organizations
+    run_sql(cur, UPSERT_ORGS)
+    conn.commit()
+    # 2) returns
+    run_sql(cur, INSERT_RETURNS)
+    conn.commit()
+    # 3) pf_payouts
+    run_sql(cur, UPSERT_PF_PAYOUTS)
+    run_sql(cur, UPSERT_PF_PAYOUTS_FALLBACK)
+    conn.commit()
+    # 4) grants
+    run_sql(cur, INSERT_GRANTS)
+    conn.commit()
+    cur.close()
+
+
+def main():
+    print("Connecting to PostgreSQL…")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            run_sql(cur, DDL_MAIN)
+            run_sql(cur, DDL_STAGING)
+        conn.commit()
+
+        print("Loading CSVs into staging…")
+        load_csvs(conn)
+
+        print("Upserting organizations, returns, payouts, and grants…")
+        transform_and_load(conn)
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
