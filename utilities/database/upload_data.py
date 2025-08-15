@@ -222,10 +222,59 @@ def _connect():
         raise SystemExit(1)
 
 
+DDL_FUNCTIONS = r"""
+-- Flexible date parser to normalize various text formats to DATE
+CREATE OR REPLACE FUNCTION parse_flex_date(t TEXT)
+RETURNS DATE
+LANGUAGE SQL
+IMMUTABLE
+AS $$
+    SELECT CASE
+        WHEN t IS NULL OR btrim(t) = '' THEN NULL
+    WHEN t ~ '^\d{4}-\d{2}-\d{2}$' THEN t::date
+    WHEN t ~ '^\d{4}-\d{2}-\d{2}[ T]' THEN left(t,10)::date
+    WHEN t ~ '^\d{4}/\d{2}/\d{2}$' THEN to_date(t,'YYYY/MM/DD')
+    WHEN t ~ '^\d{8}$' THEN to_date(t,'YYYYMMDD')
+    WHEN t ~ '^\d{1,2}/\d{1,2}/\d{2}$' THEN to_date(t,'MM/DD/YY')
+    WHEN t ~ '^\d{1,2}/\d{1,2}/\d{4}$' THEN to_date(t,'MM/DD/YYYY')
+    WHEN t ~ '^\d{1,2}/\d{1,2}/\d{4} ' THEN to_date(split_part(t,' ',1),'MM/DD/YYYY')
+    WHEN t ~ '^\d{1,2}/\d{1,2}/\d{2} ' THEN to_date(split_part(t,' ',1),'MM/DD/YY')
+    WHEN t ~ '^\d{4}-\d{2}-\d{2}T' THEN left(t,10)::date
+    WHEN t ~ '^\d{4}-\d{2}$' THEN (to_date(t||'-01','YYYY-MM-DD') + INTERVAL '1 month' - INTERVAL '1 day')::date
+    WHEN t ~ '^\d{4}$' THEN to_date(t||'-12-31','YYYY-MM-DD')
+        ELSE NULL
+    END
+$$;
+"""
+
+
 DDL_MAIN = r"""
 -- Enable helpful extensions
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS btree_gin;
+
+-- Flexible date parser to normalize various text formats to DATE
+CREATE OR REPLACE FUNCTION parse_flex_date(t TEXT)
+RETURNS DATE
+LANGUAGE SQL
+IMMUTABLE
+AS $$
+    SELECT CASE
+        WHEN t IS NULL OR btrim(t) = '' THEN NULL
+        WHEN t ~ '^\d{4}-\d{2}-\d{2}$' THEN t::date
+    WHEN t ~ '^\d{4}-\d{2}-\d{2}[ T]' THEN left(t,10)::date
+    WHEN t ~ '^\d{4}/\d{2}/\d{2}$' THEN to_date(t,'YYYY/MM/DD')
+        WHEN t ~ '^\d{8}$' THEN to_date(t,'YYYYMMDD')
+        WHEN t ~ '^\d{1,2}/\d{1,2}/\d{2}$' THEN to_date(t,'MM/DD/YY')
+        WHEN t ~ '^\d{1,2}/\d{1,2}/\d{4}$' THEN to_date(t,'MM/DD/YYYY')
+    WHEN t ~ '^\d{1,2}/\d{1,2}/\d{4} ' THEN to_date(split_part(t,' ',1),'MM/DD/YYYY')
+    WHEN t ~ '^\d{1,2}/\d{1,2}/\d{2} ' THEN to_date(split_part(t,' ',1),'MM/DD/YY')
+        WHEN t ~ '^\d{4}-\d{2}-\d{2}T' THEN left(t,10)::date
+        WHEN t ~ '^\d{4}-\d{2}$' THEN (to_date(t||'-01','YYYY-MM-DD') + INTERVAL '1 month' - INTERVAL '1 day')::date
+        WHEN t ~ '^\d{4}$' THEN to_date(t||'-12-31','YYYY-MM-DD')
+        ELSE NULL
+    END
+$$;
 
 -- 1) Organizations (foundations & public charities)
 CREATE TABLE IF NOT EXISTS organizations (
@@ -265,6 +314,8 @@ CREATE TABLE IF NOT EXISTS returns (
 CREATE INDEX IF NOT EXISTS returns_form_type_idx ON returns (form_type);
 CREATE INDEX IF NOT EXISTS returns_org_year_idx ON returns (org_id, tax_year);
 CREATE INDEX IF NOT EXISTS returns_period_end_idx ON returns (period_end);
+-- Helpful composite index for joins from grants on (org_id, period_end)
+CREATE INDEX IF NOT EXISTS returns_org_period_idx ON returns (org_id, period_end);
 
 -- 3) Grants (denormalized rows from 990-PF grant tables)
 CREATE TABLE IF NOT EXISTS grants (
@@ -343,6 +394,10 @@ CREATE TABLE IF NOT EXISTS stg_filer (
   netassets TEXT
 );
 
+-- Staging indexes to speed up joins
+CREATE INDEX IF NOT EXISTS stg_filer_ein_idx ON stg_filer (ein);
+CREATE INDEX IF NOT EXISTS stg_filer_period_end_idx ON stg_filer (taxperiodend);
+
 CREATE TABLE IF NOT EXISTS stg_index (
   ein TEXT,
   taxperiodend TEXT,
@@ -351,6 +406,9 @@ CREATE TABLE IF NOT EXISTS stg_index (
   url TEXT,
   formtype TEXT
 );
+
+CREATE INDEX IF NOT EXISTS stg_index_ein_idx ON stg_index (ein);
+CREATE INDEX IF NOT EXISTS stg_index_period_end_idx ON stg_index (taxperiodend);
 
 CREATE TABLE IF NOT EXISTS stg_grants (
   filerein TEXT,
@@ -370,6 +428,9 @@ CREATE TABLE IF NOT EXISTS stg_grants (
   grantpurpose TEXT
 );
 
+CREATE INDEX IF NOT EXISTS stg_grants_ein_idx ON stg_grants (filerein);
+CREATE INDEX IF NOT EXISTS stg_grants_period_end_idx ON stg_grants (taxperiodend);
+
 CREATE TABLE IF NOT EXISTS stg_pf_payout (
   ein TEXT,
   filername TEXT,
@@ -382,6 +443,9 @@ CREATE TABLE IF NOT EXISTS stg_pf_payout (
   payoutshortfall TEXT,
   payoutpressureindex TEXT
 );
+
+-- Helpful composite index to speed DISTINCT ON for org upsert
+CREATE INDEX IF NOT EXISTS stg_filer_ein_period_idx ON stg_filer (ein, taxperiodend DESC NULLS LAST);
 """
 
 
@@ -403,76 +467,109 @@ SELECT DISTINCT ON (s.ein)
 FROM stg_filer s
 WHERE s.ein IS NOT NULL AND s.ein <> ''
 ORDER BY s.ein,
-    NULLIF(s.taxperiodend,'')::date DESC NULLS LAST,
-    NULLIF(s.taxyear,'')::int DESC NULLS LAST
+    s.taxperiodend DESC NULLS LAST,
+    s.taxyear DESC NULLS LAST
 ON CONFLICT (ein) DO UPDATE
 SET name = EXCLUDED.name,
   city = COALESCE(EXCLUDED.city, organizations.city),
-  state= COALESCE(EXCLUDED.state, organizations.state);
+    state= COALESCE(EXCLUDED.state, organizations.state)
+WHERE organizations.name IS DISTINCT FROM EXCLUDED.name
+     OR organizations.city IS DISTINCT FROM EXCLUDED.city
+     OR organizations.state IS DISTINCT FROM EXCLUDED.state;
 """
 
 INSERT_RETURNS = r"""
 INSERT INTO returns (org_id, tax_year, period_begin, period_end, form_type, index_year, object_id, source_url, downloaded_at)
 SELECT o.org_id,
-     NULLIF(f.taxyear,'')::int,
-     NULLIF(f.taxperiodbegin,'')::date,
-     NULLIF(f.taxperiodend,'')::date,
-     CASE WHEN i.formtype='990PF' THEN 'F990PF'
-      WHEN i.formtype='990'   THEN 'F990'
-      WHEN i.formtype='990T'  THEN 'F990T'
-      ELSE 'OTHER' END,
-     NULLIF(i.index_year,'')::int,
-     i.object_id,
-     i.url,
-     now()
+    NULLIF(f.taxyear,'')::int,
+    parse_flex_date(NULLIF(f.taxperiodbegin,'')),
+    parse_flex_date(NULLIF(i.taxperiodend,'')),
+    CASE WHEN i.formtype='990PF' THEN 'F990PF'
+     WHEN i.formtype='990'   THEN 'F990'
+     WHEN i.formtype='990T'  THEN 'F990T'
+     ELSE 'OTHER' END,
+    NULLIF(i.index_year,'')::int,
+    i.object_id,
+    i.url,
+    now()
 FROM stg_index i
-JOIN stg_filer f  ON f.ein = i.ein AND f.taxperiodend = i.taxperiodend
 JOIN organizations o ON o.ein = i.ein
+LEFT JOIN stg_filer f  ON f.ein = i.ein AND parse_flex_date(f.taxperiodend) = parse_flex_date(i.taxperiodend)
+WHERE NULLIF(i.url,'') IS NOT NULL
 ON CONFLICT (org_id, period_end, form_type, source_url) DO NOTHING;
 """
 
 UPSERT_PF_PAYOUTS = r"""
+WITH p_dedup AS (
+    SELECT DISTINCT ON (ein, taxperiodend)
+                 ein, taxperiodend, filername, fyendyear, fyendmonth,
+                 distributableamount, qualifyingdistributions, undistributedincome,
+                 payoutshortfall, payoutpressureindex
+    FROM stg_pf_payout
+    WHERE ein IS NOT NULL AND ein <> ''
+    ORDER BY ein, taxperiodend, NULLIF(fyendyear,'')::int DESC NULLS LAST
+)
 INSERT INTO pf_payouts (return_id, distributable_amount, qualifying_distributions, undistributed_income,
-            payout_shortfall, payout_pressure_index, fy_end_year, fy_end_month)
+                        payout_shortfall, payout_pressure_index, fy_end_year, fy_end_month)
 SELECT r.return_id,
-  NULLIF(p.distributableamount,'')::numeric::int,
-  NULLIF(p.qualifyingdistributions,'')::numeric::int,
-  NULLIF(p.undistributedincome,'')::numeric::int,
-  NULLIF(p.payoutshortfall,'')::numeric::int,
-     NULLIF(p.payoutpressureindex,'')::numeric,
-     NULLIF(p.fyendyear,'')::int,
-     NULLIF(p.fyendmonth,'')::int
-FROM stg_pf_payout p
+    NULLIF(p.distributableamount,'')::numeric::int,
+    NULLIF(p.qualifyingdistributions,'')::numeric::int,
+    NULLIF(p.undistributedincome,'')::numeric::int,
+    NULLIF(p.payoutshortfall,'')::numeric::int,
+    NULLIF(p.payoutpressureindex,'')::numeric,
+    NULLIF(p.fyendyear,'')::int,
+    NULLIF(p.fyendmonth,'')::int
+FROM p_dedup p
 JOIN organizations o ON o.ein = p.ein
-JOIN returns r ON r.org_id = o.org_id AND r.period_end = NULLIF(p.taxperiodend,'')::date
+JOIN returns r ON r.org_id = o.org_id AND r.period_end = parse_flex_date(NULLIF(p.taxperiodend,''))
 ON CONFLICT (return_id) DO UPDATE
-SET distributable_amount = EXCLUDED.distributable_amount,
-  qualifying_distributions = EXCLUDED.qualifying_distributions;
+SET distributable_amount = COALESCE(EXCLUDED.distributable_amount, pf_payouts.distributable_amount),
+        qualifying_distributions = COALESCE(EXCLUDED.qualifying_distributions, pf_payouts.qualifying_distributions),
+        undistributed_income = COALESCE(EXCLUDED.undistributed_income, pf_payouts.undistributed_income),
+        payout_shortfall = COALESCE(EXCLUDED.payout_shortfall, pf_payouts.payout_shortfall),
+        payout_pressure_index = COALESCE(EXCLUDED.payout_pressure_index, pf_payouts.payout_pressure_index),
+        fy_end_year = COALESCE(EXCLUDED.fy_end_year, pf_payouts.fy_end_year),
+        fy_end_month = COALESCE(EXCLUDED.fy_end_month, pf_payouts.fy_end_month);
 """
 
 UPSERT_PF_PAYOUTS_FALLBACK = r"""
 -- Fallback: when no exact period_end match, attach to nearest tax_year for same org
+WITH p_dedup AS (
+    SELECT DISTINCT ON (ein, taxperiodend)
+                 ein, taxperiodend, filername, fyendyear, fyendmonth,
+                 distributableamount, qualifyingdistributions, undistributedincome,
+                 payoutshortfall, payoutpressureindex
+    FROM stg_pf_payout
+    WHERE ein IS NOT NULL AND ein <> ''
+    ORDER BY ein, taxperiodend, NULLIF(fyendyear,'')::int DESC NULLS LAST
+)
+,
+joined AS (
+    SELECT p.*, o.org_id, r_exact.return_id AS exact_return_id, r.return_id AS nearest_return_id
+    FROM p_dedup p
+    JOIN organizations o ON o.ein = p.ein
+    LEFT JOIN returns r_exact ON r_exact.org_id = o.org_id AND r_exact.period_end = parse_flex_date(NULLIF(p.taxperiodend,''))
+    JOIN LATERAL (
+        SELECT r2.return_id, r2.tax_year, r2.period_end
+        FROM returns r2
+        WHERE r2.org_id = o.org_id
+        ORDER BY ABS(r2.tax_year - NULLIF(p.fyendyear,'')::int) ASC, r2.period_end DESC NULLS LAST
+        LIMIT 1
+    ) r ON TRUE
+    WHERE r_exact.return_id IS NULL
+)
 INSERT INTO pf_payouts (return_id, distributable_amount, qualifying_distributions, undistributed_income,
-                        payout_shortfall, payout_pressure_index, fy_end_year, fy_end_month)
-SELECT r.return_id,
-       NULLIF(p.distributableamount,'')::numeric::int,
-       NULLIF(p.qualifyingdistributions,'')::numeric::int,
-       NULLIF(p.undistributedincome,'')::numeric::int,
-       NULLIF(p.payoutshortfall,'')::numeric::int,
-       NULLIF(p.payoutpressureindex,'')::numeric,
-       NULLIF(p.fyendyear,'')::int,
-       NULLIF(p.fyendmonth,'')::int
-FROM stg_pf_payout p
-JOIN organizations o ON o.ein = p.ein
-LEFT JOIN returns r_exact ON r_exact.org_id = o.org_id AND r_exact.period_end = NULLIF(p.taxperiodend,'')::date
-JOIN LATERAL (
-  SELECT r2.return_id, r2.tax_year, r2.period_end
-  FROM returns r2
-  WHERE r2.org_id = o.org_id
-  ORDER BY ABS(r2.tax_year - NULLIF(p.fyendyear,'')::int) ASC, r2.period_end DESC NULLS LAST
-  LIMIT 1
-) r ON TRUE
-WHERE r_exact.return_id IS NULL
+                                                payout_shortfall, payout_pressure_index, fy_end_year, fy_end_month)
+SELECT DISTINCT ON (COALESCE(j.exact_return_id, j.nearest_return_id))
+             COALESCE(j.exact_return_id, j.nearest_return_id) AS return_id,
+             NULLIF(j.distributableamount,'')::numeric::int,
+             NULLIF(j.qualifyingdistributions,'')::numeric::int,
+             NULLIF(j.undistributedincome,'')::numeric::int,
+             NULLIF(j.payoutshortfall,'')::numeric::int,
+             NULLIF(j.payoutpressureindex,'')::numeric,
+             NULLIF(j.fyendyear,'')::int,
+             NULLIF(j.fyendmonth,'')::int
+FROM joined j
 ON CONFLICT (return_id) DO UPDATE
 SET distributable_amount = COALESCE(EXCLUDED.distributable_amount, pf_payouts.distributable_amount),
     qualifying_distributions = COALESCE(EXCLUDED.qualifying_distributions, pf_payouts.qualifying_distributions),
@@ -484,24 +581,76 @@ SET distributable_amount = COALESCE(EXCLUDED.distributable_amount, pf_payouts.di
 """
 
 INSERT_GRANTS = r"""
+-- Build a compact mapping of (org_id, period_end) -> return_id to speed joins
+CREATE TEMP TABLE IF NOT EXISTS tmp_return_map (
+    org_id BIGINT,
+    period_end DATE,
+    return_id BIGINT,
+    PRIMARY KEY (org_id, period_end)
+) ON COMMIT DROP;
+
+TRUNCATE tmp_return_map;
+
+INSERT INTO tmp_return_map (org_id, period_end, return_id)
+SELECT r.org_id, r.period_end, r.return_id
+FROM (
+    SELECT DISTINCT ON (org_id, period_end)
+                 org_id, period_end, return_id,
+                 (form_type='F990PF') AS is_pf
+    FROM returns
+    WHERE period_end IS NOT NULL
+    ORDER BY org_id, period_end, is_pf DESC, return_id
+) r;
+
+-- Insert grants using the precomputed map
 INSERT INTO grants (return_id, funder_org_id, recipient_name_raw, recipient_name_line1, recipient_name_line2,
-          recipient_city, recipient_state, recipient_zip, recipient_country, recipient_province,
-          recipient_postal, amount_cash, amount_noncash, amount_total, purpose_text)
-SELECT r.return_id, r.org_id,
-     g.recipientname, g.recipientnameline1, g.recipientnameline2,
-     g.recipientcity, g.recipientstate, g.recipientzip, g.recipientcountry, g.recipientprovince,
-     g.recipientpostal,
-  NULLIF(g.grantamountcash,'')::numeric::int,
-  NULLIF(g.grantamountnoncash,'')::numeric::int,
-  NULLIF(g.grantamounttotal,'')::numeric::int,
-     g.grantpurpose
+                    recipient_city, recipient_state, recipient_zip, recipient_country, recipient_province,
+                    recipient_postal, amount_cash, amount_noncash, amount_total, purpose_text)
+SELECT m.return_id, m.org_id,
+         COALESCE(NULLIF(g.recipientname,''), NULLIF(g.recipientnameline1,''), NULLIF(g.recipientnameline2,''), 'UNKNOWN'),
+         g.recipientnameline1, g.recipientnameline2,
+         g.recipientcity, g.recipientstate, g.recipientzip, g.recipientcountry, g.recipientprovince,
+         g.recipientpostal,
+    NULLIF(g.grantamountcash,'')::numeric::int,
+    NULLIF(g.grantamountnoncash,'')::numeric::int,
+    NULLIF(g.grantamounttotal,'')::numeric::int,
+         g.grantpurpose
 FROM stg_grants g
 JOIN organizations o ON o.ein = g.filerein
-JOIN returns r ON r.org_id = o.org_id AND r.period_end = NULLIF(g.taxperiodend,'')::date;
+JOIN tmp_return_map m ON m.org_id = o.org_id AND m.period_end = parse_flex_date(NULLIF(g.taxperiodend,''));
+"""
+
+
+INSERT_RETURNS_FROM_GRANTS = r"""
+-- Fallback: ensure there is a returns row for each (funder EIN, period_end) present in stg_grants
+-- Lightweight version that avoids joins to stg_index/stg_filer to reduce runtime
+INSERT INTO returns (org_id, tax_year, period_begin, period_end, form_type, index_year, object_id, source_url, downloaded_at)
+SELECT o.org_id,
+       NULL,                       -- tax_year unknown here
+       NULL,                       -- period_begin unknown
+       d.period_end,
+       'F990PF',
+       NULL,                       -- index_year
+       NULL,                       -- object_id
+       'synthetic://ein='||d.ein||'&period_end='||d.period_end::text||'&form=F990PF',
+       now()
+FROM (
+    SELECT DISTINCT filerein AS ein, parse_flex_date(NULLIF(taxperiodend,'')) AS period_end
+    FROM stg_grants
+    WHERE filerein IS NOT NULL AND filerein <> '' AND NULLIF(taxperiodend,'') <> ''
+) d
+JOIN organizations o ON o.ein = d.ein
+WHERE d.period_end IS NOT NULL
+ON CONFLICT (org_id, period_end, form_type, source_url) DO NOTHING;
 """
 
 
 def run_sql(cur, sql: str):
+    # If the SQL contains a $$-quoted block (e.g., CREATE FUNCTION), execute as-is
+    if "$$" in sql:
+        cur.execute(sql)
+        return
+    # Otherwise, split on semicolons into individual statements
     for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
         cur.execute(stmt + ";")
 
@@ -681,14 +830,24 @@ def transform_and_load(conn):
     conn.commit()
     # 2) returns
     run_sql(cur, INSERT_RETURNS)
+    # 2b) returns fallback from grants if index files lack URLs or dates
+    # Allow long-running fallback without timing out
+    cur.execute("SET LOCAL statement_timeout = '0';")
+    run_sql(cur, INSERT_RETURNS_FROM_GRANTS)
     conn.commit()
-    # 3) pf_payouts
-    run_sql(cur, UPSERT_PF_PAYOUTS)
-    run_sql(cur, UPSERT_PF_PAYOUTS_FALLBACK)
-    conn.commit()
-    # 4) grants
+    # 3) grants (now that returns exist)
+    cur.execute("SET LOCAL statement_timeout = '0';")
     run_sql(cur, INSERT_GRANTS)
     conn.commit()
+    # 4) pf_payouts (best-effort; don't block grants load)
+    try:
+        cur.execute("SET LOCAL statement_timeout = '0';")
+        run_sql(cur, UPSERT_PF_PAYOUTS)
+        run_sql(cur, UPSERT_PF_PAYOUTS_FALLBACK)
+        conn.commit()
+    except Exception as e:
+        print(f"WARNING: pf_payouts upsert skipped due to: {e}")
+        conn.rollback()
     cur.close()
 
 
@@ -704,6 +863,16 @@ def _set_session_settings(conn):
             except Exception:
                 # Ignore invalid values
                 pass
+        else:
+            # Default a sane timeout to avoid indefinite hangs during DDL on busy DBs
+            cur.execute("SET statement_timeout = '60000ms';")
+        # lock timeout to avoid waiting forever on DDL
+        lock_timeout_ms = os.getenv("DB_LOCK_TIMEOUT_MS") or "15000"
+        try:
+            int(lock_timeout_ms)
+            cur.execute(f"SET lock_timeout = '{lock_timeout_ms}ms';")
+        except Exception:
+            pass
         # help identify session in DB dashboards
         cur.execute("SET application_name = 'project-donors-upload';")
     conn.commit()
@@ -718,6 +887,8 @@ def main():
         print("Ensuring main schema (extensions, tables, indexes)…", flush=True)
         with conn.cursor() as cur:
             run_sql(cur, DDL_MAIN)
+            # Always ensure functions are present/up to date
+            run_sql(cur, DDL_FUNCTIONS)
         conn.commit()
 
         print("Ensuring staging schema…", flush=True)
