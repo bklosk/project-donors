@@ -196,3 +196,32 @@ cython_debug/
 .cursorindexingignore
 .DS_Store
 .DS_Store
+.DS_Store
+.DS_Store
+
+# --- Node/Next.js (web) ---
+# App artifacts
+/web/node_modules/
+/web/.next/
+/web/out/
+/web/.vercel/
+/web/.eslintcache
+/web/coverage/
+/web/.turbo/
+/web/.cache/
+
+# Env files (keep root .env patterns above; include Next local envs)
+/web/.env.local
+/web/.env.development.local
+/web/.env.test.local
+/web/.env.production.local
+
+# Logs
+/web/npm-debug.log*
+/web/yarn-error.log*
+/web/pnpm-debug.log*
+
+# Safety: if node_modules accidentally created at repo root
+node_modules/
+npm-debug.log*
+.DS_Store

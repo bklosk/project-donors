@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 import socket
 
@@ -37,6 +37,8 @@ except ImportError as e:
 
 
 ROOT = Path(__file__).resolve().parent
+# Best-effort repo root (utilities/database -> repo root is three parents up)
+REPO_ROOT = ROOT.parent.parent.parent
 DATA_DIR = ROOT / "data"
 
 
@@ -62,7 +64,15 @@ def _connect():
     """Establish a Postgres connection with a short connect timeout and
     a quick host:port reachability probe to avoid long hangs.
     """
-    load_dotenv()  # load .env if present
+    # Load .env robustly from repo root or current working directory; do not override existing env
+    env_path = find_dotenv(usecwd=True)
+    if not env_path:
+        env_path = str((REPO_ROOT / ".env"))
+    try:
+        load_dotenv(env_path, override=False)
+    except Exception:
+        # Fall back silently if dotenv is unavailable or the file can't be read
+        pass
 
     # Allow override of timeout via env; default to 10s
     try:
@@ -79,18 +89,15 @@ def _connect():
             host = parsed.hostname or "localhost"
             port = parsed.port or 5432
 
-            # Fast TCP probe to fail fast if unreachable
+            # Fast TCP probe (warn-only) to detect obvious reachability issues
             try:
                 with socket.create_connection(
-                    (host, port), timeout=min(connect_timeout, 5)
+                    (host, port), timeout=min(connect_timeout, 10)
                 ):
                     pass
             except OSError as e:
-                print(f"ERROR: Unable to reach PostgreSQL at {host}:{port} — {e}")
-                print(
-                    "Hint: check VPN/Firewall, host/port, and SSL settings (sslmode)."
-                )
-                raise SystemExit(1)
+                print(f"WARNING: Reachability probe failed for {host}:{port} — {e}")
+                print("Continuing to attempt connection via libpq…")
 
             # Append connect_timeout to query if not already set
             q = dict(parse_qsl(parsed.query))
@@ -146,9 +153,22 @@ def _connect():
                     f"Connecting: host={kwargs.get('host')} hostaddr={kwargs.get('hostaddr')} port={kwargs.get('port')} db={kwargs.get('dbname')} sslrootcert={'yes' if 'sslrootcert' in kwargs else 'no'}",
                     flush=True,
                 )
-            return psycopg2.connect(
-                **{k: v for k, v in kwargs.items() if v is not None}
-            )
+            try:
+                return psycopg2.connect(
+                    **{k: v for k, v in kwargs.items() if v is not None}
+                )
+            except psycopg2.OperationalError as e:
+                # Retry without gssencmode if the bundled libpq doesn't support it
+                if (
+                    "invalid connection option" in str(e).lower()
+                    and "gssencmode" in str(e).lower()
+                ):
+                    kwargs.pop("gssencmode", None)
+                    return psycopg2.connect(
+                        **{k: v for k, v in kwargs.items() if v is not None}
+                    )
+                else:
+                    raise
         except psycopg2.OperationalError as e:
             print("ERROR: Failed to connect to PostgreSQL using DATABASE_URL.")
             print(str(e))
@@ -171,14 +191,13 @@ def _connect():
     if not (db and user and pwd):
         raise SystemExit("Missing DB env vars. Set DATABASE_URL or PG* variables.")
 
-    # Fast TCP probe to fail fast if unreachable
+    # Fast TCP probe (warn-only) to detect obvious reachability issues
     try:
-        with socket.create_connection((host, port), timeout=min(connect_timeout, 5)):
+        with socket.create_connection((host, port), timeout=min(connect_timeout, 10)):
             pass
     except OSError as e:
-        print(f"ERROR: Unable to reach PostgreSQL at {host}:{port} — {e}")
-        print("Hint: ensure the database is running and accessible from this machine.")
-        raise SystemExit(1)
+        print(f"WARNING: Reachability probe failed for {host}:{port} — {e}")
+        print("Continuing to attempt connection via libpq…")
 
     try:
         kwargs = {
@@ -213,7 +232,18 @@ def _connect():
                 f"Connecting: host={kwargs.get('host')} hostaddr={kwargs.get('hostaddr')} port={kwargs.get('port')} db={kwargs.get('dbname')} sslrootcert={'yes' if 'sslrootcert' in kwargs else 'no'}",
                 flush=True,
             )
-        return psycopg2.connect(**kwargs)
+        try:
+            return psycopg2.connect(**kwargs)
+        except psycopg2.OperationalError as e:
+            # Retry without gssencmode if the bundled libpq doesn't support it
+            if (
+                "invalid connection option" in str(e).lower()
+                and "gssencmode" in str(e).lower()
+            ):
+                kwargs.pop("gssencmode", None)
+                return psycopg2.connect(**kwargs)
+            else:
+                raise
     except psycopg2.OperationalError as e:
         print(
             "ERROR: Failed to connect to PostgreSQL with provided PG* environment variables."
