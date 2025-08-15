@@ -6,9 +6,9 @@ set -euo pipefail
 
 # Resolve repo root relative to this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ENV_FILE="$REPO_ROOT/.env"
-OUTPUT_DIR="$REPO_ROOT/docs"
+OUTPUT_DIR="$REPO_ROOT/utilities/schema/"
 OUTPUT_FILE="$OUTPUT_DIR/schema.sql"
 
 mkdir -p "$OUTPUT_DIR"

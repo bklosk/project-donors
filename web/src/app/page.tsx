@@ -123,9 +123,10 @@ export default function Page() {
               onToggle={() => toggle("P")}
             >
               <p className="text-[14px] leading-relaxed">
-                We prepare a concise funder brief and outreach plan tailored to
-                your goals. Deliverables and timelines are calibrated to your
-                scope.
+                You get a tailored list of private foundations, grants, and
+                corporate givers likely to support your work. You also get warm
+                intro paths, and an outreach kit that includes guidance for each
+                funder.
               </p>
             </NavItem>
 
@@ -137,8 +138,10 @@ export default function Page() {
               onToggle={() => toggle("M")}
             >
               <p className="text-[14px] leading-relaxed">
-                We map adjacent funders, trace warm paths, and prioritize
-                prospects by fit, timing, and likelihood of support.
+                We use data science to search through IRS filings, recent press,
+                public grants, and board membership. We leverage this data to
+                identify potential funders-- and warm introduction paths for
+                your nonprofit.
               </p>
             </NavItem>
           </div>
@@ -190,7 +193,7 @@ function NavItem({
         animate="rest"
         whileHover="hover"
         transition={{ duration: 0.4 }}
-        className="group flex w-full items-center justify-between border px-3 py-2 select-none text-left cursor-pointer"
+        className="group flex w-full items-center justify-between border px-3 py-2 select-none text-left cursor-pointer outline-none focus:outline-none focus-visible:outline-none focus:ring-0 focus-visible:ring-0 focus:ring-offset-0 focus-visible:ring-offset-0"
         style={{ borderColor: color }}
         whileTap={{ scale: 0.995 }}
       >

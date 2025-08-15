@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Project Donors",
+  title: "Find Funders",
   description: "Field-manual minimal placeholder",
 };
 
