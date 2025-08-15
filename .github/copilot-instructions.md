@@ -1,3 +1,3 @@
 ## Database
 
-- always read `docs/schema.sql` to see the database schema.
+- always read `utilities/schema/schema.sql` to see the database schema.
