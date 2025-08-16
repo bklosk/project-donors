@@ -11,7 +11,7 @@ const palette = {
 } as const;
 
 export default function Page() {
-  const [openKey, setOpenKey] = useState<string | null>(null);
+  const [openKey, setOpenKey] = useState<string | null>("I");
   const toggle = (k: string) => setOpenKey((prev) => (prev === k ? null : k));
 
   useEffect(() => {
@@ -52,8 +52,8 @@ export default function Page() {
       </header>
 
       {/* Body */}
-      <section className="grid items-center gap-8 md:grid-cols-[58ch_1fr] mx-auto w-full max-w-[900px] lg:max-w-[1100px] xl:max-w-[1200px]">
-        <div className="max-w-[58ch]">
+      <section className="grid items-center gap-5 md:gap-8 md:grid-cols-[58ch_1fr] mx-auto w-full max-w-[900px] lg:max-w-[1100px] xl:max-w-[1200px]">
+        <div className="max-w-[58ch] order-2 md:order-1">
           <motion.p
             initial={{ opacity: 0, y: 4 }}
             animate={{ opacity: 1, y: 0 }}
@@ -63,7 +63,7 @@ export default function Page() {
             We find warm funders that are likely to support your work.
           </motion.p>
 
-          <div className="mt-8 grid gap-3">
+          <div className="mt-6 md:mt-8 grid gap-3">
             <NavItem
               label="Get Started"
               kbd="I"
@@ -72,48 +72,59 @@ export default function Page() {
               onToggle={() => toggle("I")}
               mountDelay={0.05}
             >
-              <form className="grid gap-3">
-                <div className="grid gap-1">
-                  <label className="text-[11px] uppercase tracking-[0.18em]">
-                    Name
-                  </label>
-                  <input
-                    type="text"
-                    className="border px-2 py-1 text-[14px] bg-transparent outline-none"
-                    style={{ borderColor: palette.ink, color: palette.ink }}
-                    placeholder="Jane Smith"
-                  />
+              <div className="grid gap-3">
+                {/* Starter Package */}
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div
+                      className="text-[14px] leading-relaxed"
+                      style={{ color: palette.ink }}
+                    >
+                      Starter Package — $289
+                    </div>
+                    <div
+                      className="text-[12px]"
+                      style={{ color: palette.ink, opacity: 0.8 }}
+                    >
+                      30–50 leads, 7-day turnaround
+                    </div>
+                  </div>
+                  <a
+                    href="https://buy.stripe.com/00wcN77ZHe3X9ov6vm4ow00" // TODO: replace with your Stripe Checkout link or /api/checkout
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-block border px-4 py-2 text-[13px] uppercase tracking-[0.14em] bg-[#0098d8] text-white border-[#0098d8] transition-colors transition-transform hover:bg-[#007fb6] hover:border-[#007fb6] hover:-translate-y-[1px] focus-visible:-translate-y-[1px] focus-visible:ring-2 focus-visible:ring-[#0098d8] focus-visible:ring-offset-2 outline-none"
+                  >
+                    Pay with Stripe
+                  </a>
                 </div>
-                <div className="grid gap-1">
-                  <label className="text-[11px] uppercase tracking-[0.18em]">
-                    Email
-                  </label>
-                  <input
-                    type="email"
-                    className="border px-2 py-1 text-[14px] bg-transparent outline-none"
-                    style={{ borderColor: palette.ink, color: palette.ink }}
-                    placeholder="jane@org.org"
-                  />
+
+                {/* Custom Scope */}
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div
+                      className="text-[14px] leading-relaxed"
+                      style={{ color: palette.ink }}
+                    >
+                      Custom scope
+                    </div>
+                    <div
+                      className="text-[12px]"
+                      style={{ color: palette.ink, opacity: 0.8 }}
+                    >
+                      Book a quick call to scope your needs
+                    </div>
+                  </div>
+                  <a
+                    href="https://calendly.com/your-handle/15min" // TODO: replace with your Calendly URL
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-block border px-4 py-2 text-[13px] uppercase tracking-[0.14em] text-[#0b3536] border-[#0b3536] transition-transform hover:-translate-y-[1px] focus-visible:-translate-y-[1px] focus-visible:ring-2 focus-visible:ring-[#0098d8] focus-visible:ring-offset-2 outline-none"
+                  >
+                    Book 15-min call
+                  </a>
                 </div>
-                <div className="grid gap-1">
-                  <label className="text-[11px] uppercase tracking-[0.18em]">
-                    Organization
-                  </label>
-                  <input
-                    type="text"
-                    className="border px-2 py-1 text-[14px] bg-transparent outline-none"
-                    style={{ borderColor: palette.ink, color: palette.ink }}
-                    placeholder="Optional"
-                  />
-                </div>
-                <button
-                  type="submit"
-                  className="justify-self-start border px-3 py-1 text-[12px] uppercase tracking-[0.14em] transition-transform"
-                  style={{ borderColor: palette.ink, color: palette.ink }}
-                >
-                  Submit
-                </button>
-              </form>
+              </div>
             </NavItem>
 
             <NavItem
@@ -125,10 +136,8 @@ export default function Page() {
               mountDelay={0.1}
             >
               <p className="text-[14px] leading-relaxed">
-                You get a tailored list of private foundations, grants, and
-                corporate givers likely to support your work. You also get warm
-                intro paths, and an outreach kit that includes guidance for each
-                funder.
+                Get 30 to 50 warm private-foundation leads tailored to your org.
+                $289. Delivered in 72 hours.
               </p>
               <a
                 href="/example.pdf"
@@ -158,6 +167,7 @@ export default function Page() {
           </div>
         </div>
 
+        {/* Vignette */}
         <Vignette />
       </section>
 
@@ -270,7 +280,7 @@ function Vignette() {
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay: 0.2, duration: 0.5 }}
-      className="relative block justify-self-center md:justify-self-end pointer-events-none"
+      className="relative block order-1 md:order-2 justify-self-center md:justify-self-end pointer-events-none"
       aria-hidden="true"
     >
       <div className="relative h-[360px] w-[260px] lg:h-[440px] lg:w-[320px]">
