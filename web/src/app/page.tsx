@@ -70,6 +70,7 @@ export default function Page() {
               color={palette.ink}
               isOpen={openKey === "I"}
               onToggle={() => toggle("I")}
+              mountDelay={0.05}
             >
               <form className="grid gap-3">
                 <div className="grid gap-1">
@@ -121,6 +122,7 @@ export default function Page() {
               color={palette.blue}
               isOpen={openKey === "P"}
               onToggle={() => toggle("P")}
+              mountDelay={0.1}
             >
               <p className="text-[14px] leading-relaxed">
                 You get a tailored list of private foundations, grants, and
@@ -136,6 +138,7 @@ export default function Page() {
               color={palette.red}
               isOpen={openKey === "M"}
               onToggle={() => toggle("M")}
+              mountDelay={0.15}
             >
               <p className="text-[14px] leading-relaxed">
                 We use data science to search through IRS filings, recent press,
@@ -175,6 +178,7 @@ function NavItem({
   isOpen,
   onToggle,
   children,
+  mountDelay = 0,
 }: {
   label: string;
   kbd: string;
@@ -182,9 +186,18 @@ function NavItem({
   isOpen: boolean;
   onToggle: () => void;
   children?: ReactNode;
+  mountDelay?: number;
 }) {
   return (
-    <div>
+    <motion.div
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{
+        delay: mountDelay,
+        duration: 0.45,
+        ease: [0.2, 0.8, 0.2, 1],
+      }}
+    >
       <motion.button
         type="button"
         onClick={onToggle}
@@ -239,7 +252,7 @@ function NavItem({
           </motion.div>
         )}
       </AnimatePresence>
-    </div>
+    </motion.div>
   );
 }
 
@@ -253,6 +266,7 @@ function Vignette() {
       aria-hidden="true"
     >
       <div className="relative h-[360px] w-[260px] lg:h-[440px] lg:w-[320px]">
+        {/* back sheet */}
         <div
           className="absolute left-6 top-6 h-[360px] w-[260px] lg:h-[440px] lg:w-[320px] -rotate-2 border rounded-[6px] shadow-md"
           style={{ background: palette.paper, borderColor: palette.ink }}
@@ -263,6 +277,7 @@ function Vignette() {
           />
         </div>
 
+        {/* front sheet */}
         <div
           className="absolute left-0 top-0 h-[360px] w-[260px] lg:h-[440px] lg:w-[320px] rotate-3 border rounded-[6px] shadow-md"
           style={{ background: palette.paper, borderColor: palette.ink }}
@@ -271,23 +286,89 @@ function Vignette() {
             className="h-6 rounded-t-[6px]"
             style={{ background: palette.red }}
           />
-          <div className="p-4 space-y-2">
+          <div className="p-4 space-y-3">
             <div
-              className="h-3 w-2/3 rounded"
-              style={{ background: palette.ink, opacity: 0.15 }}
+              className="text-[10px] uppercase tracking-[0.22em] leading-none"
+              style={{ color: palette.ink, opacity: 0.6 }}
+            >
+              Funder Shortlist
+            </div>
+
+            <Entry
+              title="Acme Family Foundation"
+              noteLabel="Why it fits"
+              noteText="Gave to Peer Organization (’24)"
             />
-            <div
-              className="h-3 w-1/2 rounded"
-              style={{ background: palette.ink, opacity: 0.15 }}
+            <Entry
+              title="Northwind Trust"
+              noteLabel="Warm path"
+              noteText="Board overlap via J. Smith"
             />
-            <div
-              className="h-3 w-5/6 rounded"
-              style={{ background: palette.ink, opacity: 0.15 }}
+            <Entry
+              title="Globex Philanthropies"
+              noteLabel="Average grant"
+              noteText="$55k · Cycle: Oct–Nov"
             />
           </div>
         </div>
       </div>
     </motion.div>
+  );
+}
+
+// Minimal entry block with title + skeleton paragraphs + optional note
+function Entry({
+  title,
+  noteLabel,
+  noteText,
+}: {
+  title: string;
+  noteLabel?: string;
+  noteText?: string;
+}) {
+  return (
+    <div className="space-y-2">
+      <div
+        className="text-[12px] uppercase tracking-[0.18em] leading-none"
+        style={{ color: palette.ink }}
+      >
+        {title}
+      </div>
+      {noteLabel && noteText && (
+        <div className="pt-0.5">
+          <span
+            className="text-[10px] uppercase tracking-[0.18em] mr-1"
+            style={{ color: palette.ink, opacity: 0.65 }}
+          >
+            {noteLabel}:
+          </span>
+          <span
+            className="text-[11px] leading-snug"
+            style={{ color: palette.ink, opacity: 0.85 }}
+          >
+            {noteText}
+          </span>
+        </div>
+      )}
+      <div className="space-y-1.5">
+        <div
+          className="h-2 w-5/6 rounded"
+          style={{ background: palette.ink, opacity: 0.15 }}
+        />
+        <div
+          className="h-2 w-4/6 rounded"
+          style={{ background: palette.ink, opacity: 0.15 }}
+        />
+        <div
+          className="h-2 w-3/5 rounded"
+          style={{ background: palette.ink, opacity: 0.15 }}
+        />
+        <div
+          className="h-2 w-2/3 rounded"
+          style={{ background: palette.ink, opacity: 0.15 }}
+        />
+      </div>
+    </div>
   );
 }
 
