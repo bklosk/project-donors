@@ -130,6 +130,14 @@ export default function Page() {
                 intro paths, and an outreach kit that includes guidance for each
                 funder.
               </p>
+              <a
+                href="/example.pdf"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-block mt-3 border px-4 py-2 text-[13px] uppercase tracking-[0.14em] bg-[#0098d8] text-white border-[#0098d8] transition-colors transition-transform hover:bg-[#007fb6] hover:border-[#007fb6] hover:-translate-y-[1px] focus-visible:-translate-y-[1px] focus-visible:ring-2 focus-visible:ring-[#0098d8] focus-visible:ring-offset-2 outline-none"
+              >
+                See an example
+              </a>
             </NavItem>
 
             <NavItem
@@ -262,7 +270,7 @@ function Vignette() {
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay: 0.2, duration: 0.5 }}
-      className="relative hidden md:block justify-self-center md:justify-self-end pointer-events-none"
+      className="relative block justify-self-center md:justify-self-end pointer-events-none"
       aria-hidden="true"
     >
       <div className="relative h-[360px] w-[260px] lg:h-[440px] lg:w-[320px]">
