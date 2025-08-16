@@ -322,11 +322,14 @@ function Vignette() {
               noteLabel="Warm path"
               noteText="Board overlap via J. Smith"
             />
-            <Entry
-              title="Globex Philanthropies"
-              noteLabel="Average grant"
-              noteText="$55k · Cycle: Oct–Nov"
-            />
+            {/* Hide this on mobile to prevent overflow */}
+            <div className="hidden lg:block">
+              <Entry
+                title="Globex Philanthropies"
+                noteLabel="Average grant"
+                noteText="$55k · Cycle: Oct–Nov"
+              />
+            </div>
           </div>
         </div>
       </div>
